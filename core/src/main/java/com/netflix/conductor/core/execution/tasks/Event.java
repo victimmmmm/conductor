@@ -33,7 +33,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static com.netflix.conductor.common.metadata.tasks.TaskType.TASK_TYPE_EVENT;
-import static com.netflix.conductor.core.exception.ApplicationException.Code.INTERNAL_ERROR;
 
 @Component(TASK_TYPE_EVENT)
 public class Event extends WorkflowSystemTask {
@@ -54,35 +53,42 @@ public class Event extends WorkflowSystemTask {
 
     @Override
     public void start(Workflow workflow, Task task, WorkflowExecutor workflowExecutor) {
-
         Map<String, Object> payload = new HashMap<>(task.getInputData());
         payload.put("workflowInstanceId", workflow.getWorkflowId());
         payload.put("workflowType", workflow.getWorkflowName());
         payload.put("workflowVersion", workflow.getWorkflowVersion());
         payload.put("correlationId", workflow.getCorrelationId());
 
-        String payloadJson;
         try {
-            payloadJson = objectMapper.writeValueAsString(payload);
-        } catch (JsonProcessingException e) {
-            String msg = String.format("Error serializing JSON payload for task: %s, workflow: %s", task.getTaskId(),
-                workflow.getWorkflowId());
-            throw new ApplicationException(INTERNAL_ERROR, msg);
-        }
-        Message message = new Message(task.getTaskId(), payloadJson, task.getTaskId());
-        ObservableQueue queue = getQueue(workflow, task);
-        if (queue != null) {
-            queue.publish(Collections.singletonList(message));
-            LOGGER.debug("Published message:{} to queue:{}", message.getId(), queue.getName());
-            task.getOutputData().putAll(payload);
-            if (isAsyncComplete(task)) {
-                task.setStatus(Status.IN_PROGRESS);
-            } else {
-                task.setStatus(Status.COMPLETED);
+            String payloadJson = objectMapper.writeValueAsString(payload);
+            Message message = new Message(task.getTaskId(), payloadJson, task.getTaskId());
+            ObservableQueue queue = getQueue(workflow, task);
+            if (queue != null) {
+                queue.publish(Collections.singletonList(message));
+                LOGGER.debug("Published message:{} to queue:{}", message.getId(), queue.getName());
+                task.getOutputData().putAll(payload);
+                if (isAsyncComplete(task)) {
+                    task.setStatus(Status.IN_PROGRESS);
+                } else {
+                    task.setStatus(Status.COMPLETED);
+                }
             }
-        } else {
-            task.setReasonForIncompletion("No queue found to publish.");
+        } catch (ApplicationException ae) {
+            if (ae.isRetryable()) {
+                LOGGER.info("A transient backend error happened when task {} tried to publish an event.", task.getTaskId());
+            } else {
+                task.setStatus(Status.FAILED);
+                task.setReasonForIncompletion(ae.getMessage());
+                LOGGER.error("Error executing task: {}, workflow: {}", task.getTaskId(), workflow.getWorkflowId(), ae);
+            }
+        } catch (JsonProcessingException jpe) {
             task.setStatus(Status.FAILED);
+            task.setReasonForIncompletion("Error serializing JSON payload: " + jpe.getMessage());
+            LOGGER.error("Error serializing JSON payload for task: {}, workflow: {}", task.getTaskId(), workflow.getWorkflowId());
+        } catch (Exception e) {
+            task.setStatus(Status.FAILED);
+            task.setReasonForIncompletion(e.getMessage());
+            LOGGER.error("Error executing task: {}, workflow: {}", task.getTaskId(), workflow.getWorkflowId(), e);
         }
     }
 
@@ -95,6 +101,11 @@ public class Event extends WorkflowSystemTask {
     public void cancel(Workflow workflow, Task task, WorkflowExecutor workflowExecutor) {
         Message message = new Message(task.getTaskId(), null, task.getTaskId());
         getQueue(workflow, task).ack(Collections.singletonList(message));
+    }
+
+    @Override
+    public boolean isAsync() {
+        return true;
     }
 
     @VisibleForTesting
